@@ -390,43 +390,130 @@ def compute_collisions(sat_positions: List[Dict], threshold_km: float = 1.0) -> 
                 })
     return collisions
 
+def load_user_tles(db: Session, limit: int):
+    """
+    Load user satellites from DB and shape like Celestrak rows.
+    """
+    rows = db.query(Satellite).limit(limit).all()
+    tles = []
+    for s in rows:
+        if not (s.tle_line1 and s.tle_line2):
+            continue
+        tles.append({
+            "norad_id": str(s.catalog_number) if s.catalog_number else None,
+            "name": s.name or f"user_sat_{s.id}",
+            "l1": s.tle_line1,
+            "l2": s.tle_line2,
+            "db_id": s.id,
+            "source": "user"
+        })
+    return tles
+
+
+def store_collisions(db: Session, timestamp, collisions):
+    """
+    Save collisions to DB without duplicates.
+    Duplicate = same pair (label order sorted) + same timestamp.
+    """
+    saved = []
+    for c in collisions:
+        # sort the pair alphabetically for uniqueness
+        pair = sorted([c["name1"], c["name2"]])
+        name1, name2 = pair
+        exists = db.execute(
+            select(CollisionPrediction).where(
+                CollisionPrediction.satellite1_label == name1,
+                CollisionPrediction.satellite2_label == name2,
+                CollisionPrediction.predicted_time == timestamp
+            )
+        ).scalar_one_or_none()
+        if exists:
+            continue
+
+        row = CollisionPrediction(
+            satellite1_label=name1,
+            satellite2_label=name2,
+            distance_km=c["distance_km"],
+            predicted_time=timestamp
+        )
+        db.add(row)
+        saved.append(row)
+
+    db.commit()
+    return saved
+
+
 @app.get("/api/collisions")
 async def api_collisions(
     limit: int = Query(300, ge=10, le=2000, description="How many satellites to check"),
-    threshold_km: float = Query(1.0, ge=0.01, le=50.0, description="Collision distance threshold (km)")
+    threshold_km: float = Query(1.0, ge=0.01, le=50.0, description="Collision distance threshold (km)"),
+    db: Session = Depends(get_db)
 ):
-    async with httpx. AsyncClient(timeout=30) as client:
+    """
+    Combine user and Celestrak satellites, compute collisions,
+    save unique results, and return them cleanly.
+    """
+    # 1) user satellites
+    user_tles = load_user_tles(db, limit)
+
+    # 2) Celestrak satellites
+    async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(CELESTRAK_URL)
         r.raise_for_status()
-        tles = parse_tle(r.text)[:limit]
-        now = datetime.now(timezone.utc)
-        jd, fr = jday(now.year, now.month, now.day, now.hour, now.miniute, now.second + now.microsecond/ 1e6)
-        theta = gmst(now)
+    celestrak_tles = parse_tle(r.text)[:limit]
+    for s in celestrak_tles:
+        s["source"] = "celestrak"
 
-        positions = []
-        for row in tles:
-            try:
-                sat= Satrec.twoline2rv(row["l1"], row["l2"]) 
-                e, rvec, _ = sat.sgp4(jd, fr)
-                if e != 0:
-                    continue
-                x, y, z = eci_to_ecef(rvec[0], rvec[1], rvec[2], theta)
-                positions.append({
-                    "norad_id": row["norad_id"],
-                    "name": row["name"],
-                    "x":x, "y": y, "z":z
-                })
-            except Exception:
+    # 3) merge
+    all_tles = user_tles + celestrak_tles
+
+    # 4) get time + positions
+    now = datetime.now(timezone.utc)
+    jd, fr = jday(now.year, now.month, now.day, now.hour,
+                  now.minute, now.second + now.microsecond / 1e6)
+    theta = gmst(now)
+
+    positions = []
+    for row in all_tles:
+        try:
+            sat = Satrec.twoline2rv(row["l1"], row["l2"])
+            e, rvec, _ = sat.sgp4(jd, fr)
+            if e != 0:
                 continue
-        collisions = compute_collisions(positions, threshold_km=threshold_km)
+            x, y, z = eci_to_ecef(rvec[0], rvec[1], rvec[2], theta)
+            positions.append({
+                "name": row["name"],
+                "x": x, "y": y, "z": z,
+                "source": row["source"]
+            })
+        except Exception:
+            continue
 
-        return {
-            "timestamp": now.isoformat(),
-            "threshold_km": threshold_km,
-            "total_checked": len(positions),
-            "collision_count": len(collisions),
-            "collisions": collisions
-        }
+    # 5) reuse existing compute_collisions
+    collisions = compute_collisions(positions, threshold_km)
+
+    # 6) save to DB
+    saved = store_collisions(db, now, collisions)
+
+    # 7) clean, readable return
+    result = {
+        "timestamp": now.isoformat(),
+        "threshold_km": threshold_km,
+        "total_checked": len(positions),
+        "collision_count": len(saved),
+        "collisions": []
+    }
+
+    for c in saved:
+        result["collisions"].append({
+            "satellite1_label": c.satellite1_label,
+            "satellite2_label": c.satellite2_label,
+            "distance_km": c.distance_km,
+            "predicted_time": c.predicted_time.isoformat()
+        })
+
+    return result
+
 
 
 

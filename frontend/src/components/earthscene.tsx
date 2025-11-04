@@ -2,6 +2,8 @@ import { Canvas } from "@react-three/fiber";
 import { OrbitControls, Center, Environment, useGLTF } from "@react-three/drei";
 import { Suspense } from "react";
 import Satellites from "./satellites"; // 👈 import your satellites component
+import DeploySatelliteBox from "./DeploySatelliteBox";
+import CollisionMonitor from "./collisionmonitor";
 
 function EarthModel(props: any) {
   const gltf = useGLTF("/models/earth_mr.glb");
@@ -11,8 +13,12 @@ useGLTF.preload("/models/earth_mr.glb");
 
 export default function EarthScene() {
   return (
+    <>
+
+    <DeploySatelliteBox />
+    <CollisionMonitor />
     <Canvas
-      camera={{ position: [2, 2, 4], fov: 50, near: 0.1, far: 50000}}
+      camera={{ position: [15, 15, 25], fov: 50, near: 0.1, far: 50000}}
       dpr={[1, 2]}
       shadows
       style={{ width: "100vw", height: "100vh", background: "#0b0b0b" }}
@@ -23,7 +29,7 @@ export default function EarthScene() {
 
         {/* center your earth */}
         <Center>
-          <EarthModel scale={0.1} position={[0, -0.3, 0]} />
+          <EarthModel scale={0.6} position={[0, -0.3, 0]} />
         </Center>
 
         {/* 🌍 add satellites right here */}
@@ -38,5 +44,6 @@ export default function EarthScene() {
         <OrbitControls enableDamping makeDefault />
       </Suspense>
     </Canvas>
+    </>
   );
 }

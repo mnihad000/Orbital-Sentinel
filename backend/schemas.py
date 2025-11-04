@@ -11,3 +11,14 @@ class SatelliteOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+class CollisionOut(BaseModel):
+    satellite1_id: int | None = None
+    satellite2_id: int | None = None
+    satellite1_label: str
+    satellite2_label: str
+    distance_km: float
+    predicted_time: datetime
+
+    source1: str
+    source2: str

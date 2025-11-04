@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { InstancedMesh, Object3D } from "three";
 import { useFrame } from "@react-three/fiber";
 
-type Sat = { norad_id: string; name?: string; x: number; y: number; z: number };
+type Sat = { norad_id: string; name?: string; x: number; y: number; z: number; source?: string; };
 
 const EARTH_RADIUS_KM = 6371;   // backend positions are in km (ECEF)
 const EARTH_RADIUS_UNITS = 1;   // your Earth mesh radius in scene units
@@ -50,9 +50,19 @@ export default function Satellites({
   });
 
   return (
-    <instancedMesh ref={meshRef} args={[undefined as any, undefined as any, Math.max(1, data.length)]}>
+  <>
+    {/* regular sats */}
+    <instancedMesh ref={meshRef} args={[undefined as any, undefined as any, Math.max(1, data.filter(d => d.source !== "user").length)]}>
       <sphereGeometry args={[1, 8, 8]} />
       <meshBasicMaterial color="white" />
     </instancedMesh>
-  );
+
+    {/* user sats */}
+    <instancedMesh ref={meshRef} args={[undefined as any, undefined as any, Math.max(1, data.filter(d => d.source === "user").length)]}>
+      <sphereGeometry args={[1, 8, 8]} />
+      <meshBasicMaterial color="limegreen" />
+    </instancedMesh>
+  </>
+);
+
 }
