@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, func
 from database import get_db
 from models import Satellite
-from schemas import SatelliteOut
+from schemas import SatelliteOut, SatelliteCreate
 from typing import List, Optional
 import httpx, math
 from datetime import datetime, timezone

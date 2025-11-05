@@ -22,3 +22,9 @@ class CollisionOut(BaseModel):
 
     source1: str
     source2: str
+
+class SatelliteCreate(BaseModel):
+    catalog_number: int
+    name: str
+    tle_line1: str
+    tle_line2: str
