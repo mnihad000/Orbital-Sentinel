@@ -470,7 +470,7 @@ async def api_collisions(
     # 4) get time + positions
     now = datetime.now(timezone.utc)
     jd, fr = jday(now.year, now.month, now.day, now.hour,
-                  now.minute, now.second + now.microsecond / 1e6)
+    now.minute, now.second + now.microsecond / 1e6)
     theta = gmst(now)
 
     positions = []
