@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
 from database import get_db
-from models import Satellite
+from models import Satellite, CollisionPrediction
 from schemas import SatelliteOut, SatelliteCreate
 from typing import List, Optional
 import httpx, math
@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from sgp4.api import Satrec, jday
 from typing import List, Dict
 from pydantic import BaseModel, Field, field_validator
+import re
 
 
 app = FastAPI(title="Orbital Sentinel API", version="1.0.0")
@@ -39,6 +40,34 @@ def get_satellites(skip: int = 0, limit: int = 100, db: Session = Depends(get_db
     return satellites
 
 CELESTRAK_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle"
+
+
+async def fetch_tle_text(url: str, timeout: int = 30) -> str:
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+        return r.text
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to connect to Celestrak. Check internet/DNS and try again.",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Celestrak request timed out.",
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Celestrak returned HTTP {exc.response.status_code}.",
+        )
+    except httpx.HTTPError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Failed to fetch TLE data from Celestrak.",
+        )
 
 def parse_tle(text):
     lines = []
@@ -178,17 +207,25 @@ def eci_to_ecef(x,y,z,theta):
 
 @app.get("/api/satellites")
 async def satellites():
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(CELESTRAK_URL)
-        r.raise_for_status()
-    return parse_tle(r.text)
+    text = await fetch_tle_text(CELESTRAK_URL, timeout=30)
+    return parse_tle(text)
 
 @app.get("/api/positions")
-async def api_positions(limit: int = Query(1000, ge=1, le=20000)):
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(CELESTRAK_URL)
-        r.raise_for_status()
-    tles = parse_tle(r.text)[:limit]
+async def api_positions(
+    limit: int = Query(1000, ge=1, le=20000),
+    db: Session = Depends(get_db),
+):
+    tles = []
+    try:
+        text = await fetch_tle_text(CELESTRAK_URL, timeout=30)
+        tles = parse_tle(text)[:limit]
+        for row in tles:
+            row["source"] = "celestrak"
+    except HTTPException:
+        tles = []
+
+    user_tles = load_user_tles(db, limit)
+    all_tles = user_tles + tles
 
     now = datetime.now(timezone.utc)
     jd, fr = jday(now.year, now.month, now.day, now.hour, now.minute,
@@ -196,7 +233,7 @@ async def api_positions(limit: int = Query(1000, ge=1, le=20000)):
     theta = gmst(now)
 
     out = []
-    for row in tles:
+    for row in all_tles:
         try:
             sat = Satrec.twoline2rv(row["l1"], row["l2"])
             e, rvec, _ = sat.sgp4(jd, fr)
@@ -207,11 +244,82 @@ async def api_positions(limit: int = Query(1000, ge=1, le=20000)):
                 "norad_id": row["norad_id"],
                 "name": row["name"],
                 "x": x, "y": y, "z": z,
+                "source": row.get("source", "celestrak"),
                 "epoch_iso": now.isoformat()
             })
         except Exception:
             continue
     return out
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    v = value.strip()
+    if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+        v = v[1:-1].strip()
+    return v
+
+
+def normalize_tle_pair(line1_raw: Optional[str], line2_raw: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Try to recover valid TLE line1/line2 from noisy input:
+    - wraps in quotes
+    - accidental multi-line paste into one field
+    - duplicated line content
+    """
+    chunks = []
+    for raw in (line1_raw, line2_raw):
+        if raw is None:
+            continue
+        text = str(raw).replace("\\n", "\n")
+        text = _strip_wrapping_quotes(text)
+        chunks.extend(text.splitlines())
+
+    line1 = None
+    line2 = None
+    for c in chunks:
+        s = _strip_wrapping_quotes(c)
+        if not s:
+            continue
+        if line1 is None and s.startswith("1 "):
+            line1 = s
+        if line2 is None and s.startswith("2 "):
+            line2 = s
+
+    if line1 is None and line1_raw is not None:
+        s1 = _strip_wrapping_quotes(str(line1_raw)).strip()
+        m1 = re.search(r"(1\s.+)", s1)
+        if m1:
+            line1 = _strip_wrapping_quotes(m1.group(1))
+    if line2 is None and line2_raw is not None:
+        s2 = _strip_wrapping_quotes(str(line2_raw)).strip()
+        m2 = re.search(r"(2\s.+)", s2)
+        if m2:
+            line2 = _strip_wrapping_quotes(m2.group(1))
+
+    return line1, line2
+
+
+def tle_is_propagatable(line1: str, line2: str) -> bool:
+    """
+    Validate TLE by attempting SGP4 propagation at current UTC time.
+    """
+    try:
+        sat = Satrec.twoline2rv(line1, line2)
+        now = datetime.now(timezone.utc)
+        jd, fr = jday(
+            now.year,
+            now.month,
+            now.day,
+            now.hour,
+            now.minute,
+            now.second + now.microsecond / 1e6,
+        )
+        e, rvec, _ = sat.sgp4(jd, fr)
+        if e != 0:
+            return False
+        return all(math.isfinite(v) for v in rvec)
+    except Exception:
+        return False
 
 @app.post("/ingest/celestrak")
 async def ingest_celestrak(
@@ -219,10 +327,7 @@ async def ingest_celestrak(
     db: Session = Depends(get_db),
 ):
     # fetch raw TLE text
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.get(url or CELESTRAK_URL)
-        r.raise_for_status()
-    text = r.text
+    text = await fetch_tle_text(url or CELESTRAK_URL, timeout=60)
 
     # parse with your existing helper
     records = parse_tle(text)
@@ -287,11 +392,17 @@ def create_satellite(payload: SatelliteCreate, db: Session = Depends(get_db)):
     if exists:
         raise HTTPException(status_code=409, detail="catalog_number already exists")
 
+    l1, l2 = normalize_tle_pair(payload.tle_line1, payload.tle_line2)
+    if not (l1 and l2):
+        raise HTTPException(status_code=422, detail="Invalid TLE: expected line1 starting with '1 ' and line2 starting with '2 '")
+    if not tle_is_propagatable(l1, l2):
+        raise HTTPException(status_code=422, detail="Invalid or non-propagatable TLE at current epoch")
+
     sat = Satellite(
         catalog_number=catalog,
         name=payload.name,
-        tle_line1=payload.tle_line1,
-        tle_line2=payload.tle_line2,
+        tle_line1=l1,
+        tle_line2=l2,
     )
     db.add(sat)
     db.commit()
@@ -324,10 +435,16 @@ def update_satellite(sat_id: int, payload: SatelliteUpdate, db: Session = Depend
     # patch the rest
     if payload.name is not None:
         sat.name = payload.name
-    if payload.tle_line1 is not None:
-        sat.tle_line1 = payload.tle_line1
-    if payload.tle_line2 is not None:
-        sat.tle_line2 = payload.tle_line2
+    next_l1 = payload.tle_line1 if payload.tle_line1 is not None else sat.tle_line1
+    next_l2 = payload.tle_line2 if payload.tle_line2 is not None else sat.tle_line2
+    if payload.tle_line1 is not None or payload.tle_line2 is not None:
+        l1, l2 = normalize_tle_pair(next_l1, next_l2)
+        if not (l1 and l2):
+            raise HTTPException(status_code=422, detail="Invalid TLE: expected line1 starting with '1 ' and line2 starting with '2 '")
+        if not tle_is_propagatable(l1, l2):
+            raise HTTPException(status_code=422, detail="Invalid or non-propagatable TLE at current epoch")
+        sat.tle_line1 = l1
+        sat.tle_line2 = l2
 
     db.commit()
     db.refresh(sat)
@@ -384,9 +501,13 @@ def compute_collisions(sat_positions: List[Dict], threshold_km: float = 1.0) -> 
 
             if dist < threshold_km:
                 collisions.append({
-                    "sat1": sat1["name"] or sat1["norad_id"],
-                    "sat2": sat2["name"] or sat2["norad_id"],
-                    "distance_km": round(dist, 3)
+                    "sat1": sat1["name"],
+                    "sat2": sat2["name"],
+                    "source1": sat1.get("source"),
+                    "source2": sat2.get("source"),
+                    "satellite1_id": sat1.get("db_id"),
+                    "satellite2_id": sat2.get("db_id"),
+                    "distance_km": round(dist, 3),
                 })
     return collisions
 
@@ -399,11 +520,16 @@ def load_user_tles(db: Session, limit: int):
     for s in rows:
         if not (s.tle_line1 and s.tle_line2):
             continue
+        l1, l2 = normalize_tle_pair(s.tle_line1, s.tle_line2)
+        if not (l1 and l2):
+            continue
+        if not tle_is_propagatable(l1, l2):
+            continue
         tles.append({
             "norad_id": str(s.catalog_number) if s.catalog_number else None,
             "name": s.name or f"user_sat_{s.id}",
-            "l1": s.tle_line1,
-            "l2": s.tle_line2,
+            "l1": l1,
+            "l2": l2,
             "db_id": s.id,
             "source": "user"
         })
@@ -412,18 +538,22 @@ def load_user_tles(db: Session, limit: int):
 
 def store_collisions(db: Session, timestamp, collisions):
     """
-    Save collisions to DB without duplicates.
-    Duplicate = same pair (label order sorted) + same timestamp.
+    Save collisions to DB when both satellites come from user DB rows.
+    Duplicate = same ordered pair of DB ids + same timestamp.
     """
-    saved = []
+    saved = 0
     for c in collisions:
-        # sort the pair alphabetically for uniqueness
-        pair = sorted([c["name1"], c["name2"]])
-        name1, name2 = pair
+        id1 = c.get("satellite1_id")
+        id2 = c.get("satellite2_id")
+        if id1 is None or id2 is None:
+            continue
+        if id1 > id2:
+            id1, id2 = id2, id1
+
         exists = db.execute(
             select(CollisionPrediction).where(
-                CollisionPrediction.satellite1_label == name1,
-                CollisionPrediction.satellite2_label == name2,
+                CollisionPrediction.satellite1_id == id1,
+                CollisionPrediction.satellite2_id == id2,
                 CollisionPrediction.predicted_time == timestamp
             )
         ).scalar_one_or_none()
@@ -431,13 +561,14 @@ def store_collisions(db: Session, timestamp, collisions):
             continue
 
         row = CollisionPrediction(
-            satellite1_label=name1,
-            satellite2_label=name2,
+            satellite1_id=id1,
+            satellite2_id=id2,
+            probability=None,
             distance_km=c["distance_km"],
             predicted_time=timestamp
         )
         db.add(row)
-        saved.append(row)
+        saved += 1
 
     db.commit()
     return saved
@@ -457,12 +588,14 @@ async def api_collisions(
     user_tles = load_user_tles(db, limit)
 
     # 2) Celestrak satellites
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(CELESTRAK_URL)
-        r.raise_for_status()
-    celestrak_tles = parse_tle(r.text)[:limit]
-    for s in celestrak_tles:
-        s["source"] = "celestrak"
+    celestrak_tles = []
+    try:
+        text = await fetch_tle_text(CELESTRAK_URL, timeout=30)
+        celestrak_tles = parse_tle(text)[:limit]
+        for s in celestrak_tles:
+            s["source"] = "celestrak"
+    except HTTPException:
+        celestrak_tles = []
 
     # 3) merge
     all_tles = user_tles + celestrak_tles
@@ -484,7 +617,8 @@ async def api_collisions(
             positions.append({
                 "name": row["name"],
                 "x": x, "y": y, "z": z,
-                "source": row["source"]
+                "source": row["source"],
+                "db_id": row.get("db_id"),
             })
         except Exception:
             continue
@@ -493,23 +627,26 @@ async def api_collisions(
     collisions = compute_collisions(positions, threshold_km)
 
     # 6) save to DB
-    saved = store_collisions(db, now, collisions)
+    saved_count = store_collisions(db, now, collisions)
 
     # 7) clean, readable return
     result = {
         "timestamp": now.isoformat(),
         "threshold_km": threshold_km,
         "total_checked": len(positions),
-        "collision_count": len(saved),
+        "collision_count": len(collisions),
+        "saved_to_db": saved_count,
         "collisions": []
     }
 
-    for c in saved:
+    for c in collisions:
         result["collisions"].append({
-            "satellite1_label": c.satellite1_label,
-            "satellite2_label": c.satellite2_label,
-            "distance_km": c.distance_km,
-            "predicted_time": c.predicted_time.isoformat()
+            "satellite1_label": c["sat1"],
+            "satellite2_label": c["sat2"],
+            "source1": c["source1"],
+            "source2": c["source2"],
+            "distance_km": c["distance_km"],
+            "predicted_time": now.isoformat(),
         })
 
     return result
@@ -520,3 +657,4 @@ async def api_collisions(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

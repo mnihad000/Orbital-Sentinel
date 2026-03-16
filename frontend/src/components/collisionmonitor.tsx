@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { API_BASE_URL } from "../config";
 
 export default function CollisionMonitor() {
   const [collisions, setCollisions] = useState<any[]>([]);
@@ -7,12 +8,19 @@ export default function CollisionMonitor() {
   useEffect(() => {
     const load = async () => {
       try {
-        const res = await fetch("http://127.0.0.1:8000/api/collisions");
-        if (!res.ok) return;
+        const res = await fetch(`${API_BASE_URL}/api/collisions`);
+        if (!res.ok) {
+          setCollisions([]);
+          setTotal(0);
+          return;
+        }
         const data = await res.json();
         setCollisions(data.collisions || []);
         setTotal(data.collision_count || 0);
-      } catch {}
+      } catch {
+        setCollisions([]);
+        setTotal(0);
+      }
     };
     load();
     const id = setInterval(load, 8000);
@@ -21,12 +29,12 @@ export default function CollisionMonitor() {
 
   return (
     <div style={boxStyle}>
-      <h3>☄️ Collision Monitor</h3>
+      <h3>Collision Monitor</h3>
       <p>Total: {total}</p>
       <ul style={{ fontSize: "0.85rem", maxHeight: "150px", overflowY: "auto" }}>
         {collisions.slice(0, 5).map((c, i) => (
           <li key={i}>
-            {c.satellite1_label} vs {c.satellite2_label} — {c.distance_km} km
+            {c.satellite1_label} vs {c.satellite2_label} - {c.distance_km} km
           </li>
         ))}
       </ul>

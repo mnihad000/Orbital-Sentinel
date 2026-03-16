@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { API_BASE_URL } from "../config";
 
 export default function DeploySatelliteBox() {
   const [form, setForm] = useState({
@@ -18,22 +19,25 @@ export default function DeploySatelliteBox() {
     e.preventDefault();
     setStatus("Deploying...");
     try {
-      const res = await fetch("http://127.0.0.1:8000/satellites", {
+      const res = await fetch(`${API_BASE_URL}/satellites`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(form),
       });
-      if (!res.ok) throw new Error("Failed to deploy satellite.");
-      setStatus("✅ Satellite deployed successfully!");
+      const payload = await res.json().catch(() => ({} as any));
+      if (res.status === 409) throw new Error("Catalog number already exists.");
+      if (res.status === 422) throw new Error(payload?.detail || "Invalid satellite input.");
+      if (!res.ok) throw new Error(payload?.detail || "Failed to deploy satellite.");
+      setStatus("Satellite deployed successfully.");
       setForm({ catalog_number: "", name: "", tle_line1: "", tle_line2: "" });
-    } catch (err) {
-      setStatus("❌ Error deploying satellite.");
+    } catch (err: any) {
+      setStatus(`Error: ${err?.message || "deploy failed"}`);
     }
   };
 
   return (
     <div style={boxStyle}>
-      <h3 style={{ marginBottom: "0.75rem", fontWeight: "600" }}>🚀 Deploy Satellite</h3>
+      <h3 style={{ marginBottom: "0.75rem", fontWeight: "600" }}>Deploy Satellite</h3>
       <form onSubmit={handleSubmit} style={formStyle}>
         <input name="catalog_number" placeholder="Catalog Number" value={form.catalog_number} onChange={handleChange} style={inputStyle} />
         <input name="name" placeholder="Satellite Name" value={form.name} onChange={handleChange} style={inputStyle} />
@@ -81,4 +85,3 @@ const buttonStyle: React.CSSProperties = {
   fontWeight: "bold",
   cursor: "pointer",
 };
-
