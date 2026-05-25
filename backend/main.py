@@ -6,7 +6,7 @@ from database import get_db
 from models import Satellite, CollisionPrediction
 from schemas import SatelliteOut, SatelliteCreate
 from typing import List, Optional
-import httpx, math
+import httpx, math, os
 from datetime import datetime, timezone
 from sgp4.api import Satrec, jday
 from typing import List, Dict
@@ -36,10 +36,67 @@ def read_root():
 
 @app.get("/satellites/")
 def get_satellites(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    satellites = db.query(Satellite).offset(skip).limit(limit).all()
+    satellites = (
+        db.query(Satellite)
+        .filter(Satellite.source == USER_SOURCE)
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
     return satellites
 
 CELESTRAK_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle"
+SPACETRACK_BASE_URL = "https://www.space-track.org"
+SPACETRACK_GP_TLE_PATH = (
+    "/basicspacedata/query/class/gp/"
+    "decay_date/null-val/"
+    "epoch/%3Enow-10/"
+    "orderby/norad_cat_id/"
+    "format/tle"
+)
+PUBLIC_SOURCE = "spacetrack"
+USER_SOURCE = "user"
+PUBLIC_CACHE_SOURCES = (PUBLIC_SOURCE, "celestrak")
+
+
+def load_local_env_file() -> None:
+    """
+    Lightweight support for the repo's api.env file without adding a dependency.
+    Real deployments should set environment variables directly.
+    """
+    candidates = [
+        os.path.join(os.getcwd(), "api.env"),
+        os.path.join(os.getcwd(), "..", "api.env"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw or raw.startswith("#") or "=" not in raw:
+                        continue
+                    key, value = raw.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        except OSError:
+            continue
+
+
+load_local_env_file()
+
+
+def get_spacetrack_credentials() -> tuple[Optional[str], Optional[str]]:
+    username = os.getenv("SPACETRACK_USERNAME") or os.getenv("SPACETRACK_USER")
+    password = os.getenv("SPACETRACK_PASSWORD") or os.getenv("SPACETRACK_PASS")
+    if username and username.lower() in {"your_email", "your_username"}:
+        username = None
+    if password and password.lower() in {"your_password", "your_pass"}:
+        password = None
+    return username, password
 
 
 async def fetch_tle_text(url: str, timeout: int = 30) -> str:
@@ -69,6 +126,53 @@ async def fetch_tle_text(url: str, timeout: int = 30) -> str:
             detail="Failed to fetch TLE data from Celestrak.",
         )
 
+
+async def fetch_spacetrack_tle_text(timeout: int = 60) -> str:
+    username, password = get_spacetrack_credentials()
+    if not username or not password:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Space-Track credentials are not configured. Set "
+                "SPACETRACK_USERNAME/SPACETRACK_PASSWORD or "
+                "SPACETRACK_USER/SPACETRACK_PASS on the backend."
+            ),
+        )
+
+    async with httpx.AsyncClient(base_url=SPACETRACK_BASE_URL, timeout=timeout) as client:
+        try:
+            login = await client.post(
+                "/ajaxauth/login",
+                data={"identity": username, "password": password},
+            )
+            login.raise_for_status()
+
+            response = await client.get(SPACETRACK_GP_TLE_PATH)
+            response.raise_for_status()
+            if "<html" in response.text.lower():
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Space-Track returned an HTML response instead of TLE data.",
+                )
+            return response.text
+        except HTTPException:
+            raise
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Space-Track request timed out.",
+            )
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Space-Track returned HTTP {exc.response.status_code}.",
+            )
+        except httpx.HTTPError:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to fetch TLE data from Space-Track.",
+            )
+
 def parse_tle(text):
     lines = []
     for l in text.splitlines():
@@ -85,7 +189,7 @@ def parse_tle(text):
             i += 1
             continue
 
-        norad = l1.split()[1]
+        norad = l1[2:7].strip()
 
         out.append({
             "norad_id": norad,
@@ -98,7 +202,15 @@ def parse_tle(text):
 
     return out
 
-def upsert_satellite_from_tle(db: Session, *, catalog_number: str, name: Optional[str], l1: str, l2: str) -> str:
+def upsert_satellite_from_tle(
+    db: Session,
+    *,
+    catalog_number: str,
+    name: Optional[str],
+    l1: str,
+    l2: str,
+    source: str = USER_SOURCE,
+) -> str:
     """
     Insert or update a satellite by NORAD catalog number.
     Returns 'created' or 'updated' or 'skipped' (if nothing changed).
@@ -109,6 +221,8 @@ def upsert_satellite_from_tle(db: Session, *, catalog_number: str, name: Optiona
     ).scalar_one_or_none()
 
     if existing:
+        if existing.source == USER_SOURCE and source != USER_SOURCE:
+            return "skipped"
         changed = False
         if name and existing.name != name:
             existing.name = name; changed = True
@@ -116,7 +230,10 @@ def upsert_satellite_from_tle(db: Session, *, catalog_number: str, name: Optiona
             existing.tle_line1 = l1; changed = True
         if existing.tle_line2 != l2:
             existing.tle_line2 = l2; changed = True
+        if existing.source != source:
+            existing.source = source; changed = True
         if changed:
+            existing.last_updated = datetime.utcnow()
             db.add(existing)
             return "updated"
         return "skipped"
@@ -126,6 +243,8 @@ def upsert_satellite_from_tle(db: Session, *, catalog_number: str, name: Optiona
         name=name,
         tle_line1=l1,
         tle_line2=l2,
+        source=source,
+        last_updated=datetime.utcnow(),
     )
     db.add(sat)
     return "created"
@@ -189,6 +308,7 @@ class SatelliteOut(BaseModel):
     name: Optional[str] = None
     tle_line1: Optional[str] = None
     tle_line2: Optional[str] = None
+    source: Optional[str] = None
 
     class Config:
         from_attributes = True  # allows returning SQLAlchemy objects
@@ -206,26 +326,76 @@ def eci_to_ecef(x,y,z,theta):
     return c*x + s*y, -s*x + c*y, z  # km
 
 @app.get("/api/satellites")
-async def satellites():
-    text = await fetch_tle_text(CELESTRAK_URL, timeout=30)
-    return parse_tle(text)
+async def satellites(limit: int = Query(1000, ge=1, le=20000), db: Session = Depends(get_db)):
+    records = load_cached_public_tles(db, limit)
+    if not records:
+        raise_empty_public_cache()
+    return records
+
+
+def raise_empty_public_cache():
+    username, password = get_spacetrack_credentials()
+    credential_detail = (
+        "Space-Track credentials are not configured."
+        if not username or not password
+        else "Space-Track credentials are configured, but no cached public TLEs exist yet."
+    )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=(
+            f"{credential_detail} Run POST /ingest/spacetrack to populate the local "
+            "satellite cache before using live public positions."
+        ),
+    )
+
+
+def shape_tle_from_satellite(row: Satellite, source: str) -> Optional[Dict]:
+    if not (row.tle_line1 and row.tle_line2):
+        return None
+    l1, l2 = normalize_tle_pair(row.tle_line1, row.tle_line2)
+    if not (l1 and l2):
+        return None
+    catalog = (
+        _strip_wrapping_quotes(str(row.catalog_number))
+        if row.catalog_number is not None
+        else None
+    )
+    name = _strip_wrapping_quotes(row.name) if row.name else f"{source}_sat_{row.id}"
+    return {
+        "norad_id": catalog,
+        "name": name,
+        "l1": l1,
+        "l2": l2,
+        "db_id": row.id,
+        "source": source,
+    }
+
+
+def load_cached_public_tles(db: Session, limit: int):
+    rows = (
+        db.query(Satellite)
+        .filter(Satellite.source.in_(PUBLIC_CACHE_SOURCES))
+        .order_by(Satellite.catalog_number.asc())
+        .limit(limit)
+        .all()
+    )
+    tles = []
+    for row in rows:
+        shaped = shape_tle_from_satellite(row, row.source or PUBLIC_SOURCE)
+        if shaped:
+            tles.append(shaped)
+    return tles
 
 @app.get("/api/positions")
 async def api_positions(
     limit: int = Query(1000, ge=1, le=20000),
     db: Session = Depends(get_db),
 ):
-    tles = []
-    try:
-        text = await fetch_tle_text(CELESTRAK_URL, timeout=30)
-        tles = parse_tle(text)[:limit]
-        for row in tles:
-            row["source"] = "celestrak"
-    except HTTPException:
-        tles = []
-
     user_tles = load_user_tles(db, limit)
-    all_tles = user_tles + tles
+    public_tles = load_cached_public_tles(db, limit)
+    if not user_tles and not public_tles:
+        raise_empty_public_cache()
+    all_tles = user_tles + public_tles
 
     now = datetime.now(timezone.utc)
     jd, fr = jday(now.year, now.month, now.day, now.hour, now.minute,
@@ -244,7 +414,7 @@ async def api_positions(
                 "norad_id": row["norad_id"],
                 "name": row["name"],
                 "x": x, "y": y, "z": z,
-                "source": row.get("source", "celestrak"),
+                "source": row.get("source", PUBLIC_SOURCE),
                 "epoch_iso": now.isoformat()
             })
         except Exception:
@@ -321,40 +491,31 @@ def tle_is_propagatable(line1: str, line2: str) -> bool:
     except Exception:
         return False
 
-@app.post("/ingest/celestrak")
-async def ingest_celestrak(
-    url: Optional[str] = Query(None, description="Optional override of the Celestrak TLE URL"),
-    db: Session = Depends(get_db),
-):
-    # fetch raw TLE text
-    text = await fetch_tle_text(url or CELESTRAK_URL, timeout=60)
 
-    # parse with your existing helper
-    records = parse_tle(text)
-
+def ingest_tle_records(db: Session, records: List[Dict], source: str) -> Dict:
     created = 0
     updated = 0
     skipped = 0
     malformed = 0
 
-    # upsert each entry
     for rec in records:
         try:
-            catalog = rec.get("norad_id")
+            catalog_raw = str(rec.get("norad_id") or "").strip()
             name = rec.get("name")
             l1 = rec.get("l1")
             l2 = rec.get("l2")
 
-            if not (catalog and l1 and l2):
+            if not (catalog_raw and catalog_raw.isdigit() and l1 and l2):
                 malformed += 1
                 continue
 
             result = upsert_satellite_from_tle(
                 db,
-                catalog_number=catalog,  # rename to 'norad_id=' if your column is named that
+                catalog_number=int(catalog_raw),
                 name=name,
                 l1=l1,
                 l2=l2,
+                source=source,
             )
             if result == "created":
                 created += 1
@@ -363,21 +524,55 @@ async def ingest_celestrak(
             else:
                 skipped += 1
         except Exception:
-            # keep the ingest resilient; count and move on
             malformed += 1
             continue
 
-    # single commit at the end for speed
     db.commit()
-
     return {
-        "ok": True,
-        "source": url or CELESTRAK_URL,
         "total_seen": len(records),
         "created": created,
         "updated": updated,
         "skipped": skipped,
         "malformed": malformed,
+    }
+
+@app.post("/ingest/celestrak")
+async def ingest_celestrak(
+    url: Optional[str] = Query(None, description="Optional override of the Celestrak TLE URL"),
+    enable_fallback: bool = Query(False, description="Explicitly enable disabled CelesTrak fallback ingest"),
+    db: Session = Depends(get_db),
+):
+    if not enable_fallback:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="CelesTrak ingest is disabled by default. Use POST /ingest/spacetrack.",
+        )
+
+    # fetch raw TLE text
+    text = await fetch_tle_text(url or CELESTRAK_URL, timeout=60)
+
+    # parse with your existing helper
+    records = parse_tle(text)
+    counts = ingest_tle_records(db, records, source="celestrak")
+
+    return {
+        "ok": True,
+        "source": url or CELESTRAK_URL,
+        **counts,
+    }
+
+
+@app.post("/ingest/spacetrack")
+async def ingest_spacetrack(db: Session = Depends(get_db)):
+    text = await fetch_spacetrack_tle_text(timeout=60)
+    records = parse_tle(text)
+    counts = ingest_tle_records(db, records, source=PUBLIC_SOURCE)
+
+    return {
+        "ok": True,
+        "source": "space-track gp tle",
+        "cache_source": PUBLIC_SOURCE,
+        **counts,
     }
 
 # ---------- CREATE ----------
@@ -403,6 +598,8 @@ def create_satellite(payload: SatelliteCreate, db: Session = Depends(get_db)):
         name=payload.name,
         tle_line1=l1,
         tle_line2=l2,
+        source=USER_SOURCE,
+        last_updated=datetime.utcnow(),
     )
     db.add(sat)
     db.commit()
@@ -445,6 +642,7 @@ def update_satellite(sat_id: int, payload: SatelliteUpdate, db: Session = Depend
             raise HTTPException(status_code=422, detail="Invalid or non-propagatable TLE at current epoch")
         sat.tle_line1 = l1
         sat.tle_line2 = l2
+    sat.last_updated = datetime.utcnow()
 
     db.commit()
     db.refresh(sat)
@@ -471,7 +669,7 @@ def list_satellites_simple(
     page = clamp_page(page)
     page_size = clamp_page_size(page_size)
 
-    q = select(Satellite)
+    q = select(Satellite).where(Satellite.source == USER_SOURCE)
     if search:
         pattern = f"%{search}%"
         q = q.where(
@@ -513,26 +711,14 @@ def compute_collisions(sat_positions: List[Dict], threshold_km: float = 1.0) -> 
 
 def load_user_tles(db: Session, limit: int):
     """
-    Load user satellites from DB and shape like Celestrak rows.
+    Load user satellites from DB and shape like cached TLE rows.
     """
-    rows = db.query(Satellite).limit(limit).all()
+    rows = db.query(Satellite).filter(Satellite.source == USER_SOURCE).limit(limit).all()
     tles = []
     for s in rows:
-        if not (s.tle_line1 and s.tle_line2):
-            continue
-        l1, l2 = normalize_tle_pair(s.tle_line1, s.tle_line2)
-        if not (l1 and l2):
-            continue
-        if not tle_is_propagatable(l1, l2):
-            continue
-        tles.append({
-            "norad_id": str(s.catalog_number) if s.catalog_number else None,
-            "name": s.name or f"user_sat_{s.id}",
-            "l1": l1,
-            "l2": l2,
-            "db_id": s.id,
-            "source": "user"
-        })
+        shaped = shape_tle_from_satellite(s, USER_SOURCE)
+        if shaped:
+            tles.append(shaped)
     return tles
 
 
@@ -581,24 +767,19 @@ async def api_collisions(
     db: Session = Depends(get_db)
 ):
     """
-    Combine user and Celestrak satellites, compute collisions,
+    Combine user and cached public satellites, compute collisions,
     save unique results, and return them cleanly.
     """
     # 1) user satellites
     user_tles = load_user_tles(db, limit)
 
-    # 2) Celestrak satellites
-    celestrak_tles = []
-    try:
-        text = await fetch_tle_text(CELESTRAK_URL, timeout=30)
-        celestrak_tles = parse_tle(text)[:limit]
-        for s in celestrak_tles:
-            s["source"] = "celestrak"
-    except HTTPException:
-        celestrak_tles = []
+    # 2) cached public satellites
+    public_tles = load_cached_public_tles(db, limit)
+    if not user_tles and not public_tles:
+        raise_empty_public_cache()
 
     # 3) merge
-    all_tles = user_tles + celestrak_tles
+    all_tles = user_tles + public_tles
 
     # 4) get time + positions
     now = datetime.now(timezone.utc)

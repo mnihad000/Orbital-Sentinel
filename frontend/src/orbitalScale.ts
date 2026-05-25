@@ -1,0 +1,4 @@
+export const EARTH_RADIUS_KM = 6371;
+export const EARTH_RADIUS_UNITS = 60;
+export const SATELLITE_DOT_UNITS = 40;
+export const KM_TO_SCENE_UNITS = EARTH_RADIUS_UNITS / EARTH_RADIUS_KM;

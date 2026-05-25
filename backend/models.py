@@ -13,6 +13,7 @@ class Satellite(Base):
     name = Column(String, index=True)
     tle_line1 = Column(Text)  # First line of TLE data
     tle_line2 = Column(Text)  # Second line of TLE data
+    source = Column(String, default="user", index=True)
     last_updated = Column(DateTime, default=datetime.datetime.utcnow)
 
 class CollisionPrediction(Base):

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { InstancedMesh, Object3D } from "three";
-import { useFrame } from "@react-three/fiber";
+import { ThreeEvent, useFrame } from "@react-three/fiber";
+import { EARTH_RADIUS_UNITS, KM_TO_SCENE_UNITS } from "../orbitalScale";
 
 export type Sat = {
   norad_id: string;
@@ -11,9 +12,7 @@ export type Sat = {
   source?: string;
 };
 
-const EARTH_RADIUS_KM = 6371;
-const EARTH_RADIUS_UNITS = 0.6;
-const KM2U = EARTH_RADIUS_UNITS / EARTH_RADIUS_KM;
+const KM2U = KM_TO_SCENE_UNITS;
 
 export default function Satellites({
   endpoint,
@@ -21,12 +20,14 @@ export default function Satellites({
   refreshMs = 5000,
   dotScale = 0.06,
   onUserSatellitesChange,
+  onSatelliteSelect,
 }: {
   endpoint: string;
   limit?: number;
   refreshMs?: number;
   dotScale?: number;
   onUserSatellitesChange?: (sats: Sat[]) => void;
+  onSatelliteSelect?: (satellite: Sat) => void;
 }) {
   const publicMeshRef = useRef<InstancedMesh>(null!);
   const userMeshRef = useRef<InstancedMesh>(null!);
@@ -69,7 +70,8 @@ export default function Satellites({
     for (let i = 0; i < publicSats.length; i++) {
       const p = publicSats[i];
       dummy.position.set(p.x * KM2U, p.y * KM2U, p.z * KM2U);
-      dummy.scale.setScalar(dotScale);
+      const orbitalScale = Math.max(1, dummy.position.length() / EARTH_RADIUS_UNITS);
+      dummy.scale.setScalar(dotScale * orbitalScale);
       dummy.updateMatrix();
       publicMesh.setMatrixAt(i, dummy.matrix);
     }
@@ -79,7 +81,8 @@ export default function Satellites({
     for (let i = 0; i < userSats.length; i++) {
       const p = userSats[i];
       dummy.position.set(p.x * KM2U, p.y * KM2U, p.z * KM2U);
-      dummy.scale.setScalar(dotScale);
+      const orbitalScale = Math.max(1, dummy.position.length() / EARTH_RADIUS_UNITS);
+      dummy.scale.setScalar(dotScale * orbitalScale);
       dummy.updateMatrix();
       userMesh.setMatrixAt(i, dummy.matrix);
     }
@@ -87,22 +90,38 @@ export default function Satellites({
     userMesh.instanceMatrix.needsUpdate = true;
   });
 
+  const handlePublicClick = (event: ThreeEvent<MouseEvent>) => {
+    event.stopPropagation();
+    if (typeof event.instanceId === "number" && publicSats[event.instanceId]) {
+      onSatelliteSelect?.(publicSats[event.instanceId]);
+    }
+  };
+
+  const handleUserClick = (event: ThreeEvent<MouseEvent>) => {
+    event.stopPropagation();
+    if (typeof event.instanceId === "number" && userSats[event.instanceId]) {
+      onSatelliteSelect?.(userSats[event.instanceId]);
+    }
+  };
+
   return (
     <>
       <instancedMesh
         ref={publicMeshRef}
         args={[undefined as any, undefined as any, Math.max(1, publicSats.length)]}
+        onClick={handlePublicClick}
       >
-        <sphereGeometry args={[1, 8, 8]} />
-        <meshBasicMaterial color="white" />
+        <sphereGeometry args={[1, 12, 12]} />
+        <meshBasicMaterial color="white" depthTest={false} depthWrite={false} />
       </instancedMesh>
 
       <instancedMesh
         ref={userMeshRef}
         args={[undefined as any, undefined as any, Math.max(1, userSats.length)]}
+        onClick={handleUserClick}
       >
-        <sphereGeometry args={[1, 8, 8]} />
-        <meshBasicMaterial color="white" />
+        <sphereGeometry args={[1, 12, 12]} />
+        <meshBasicMaterial color="#7dd3fc" depthTest={false} depthWrite={false} />
       </instancedMesh>
     </>
   );

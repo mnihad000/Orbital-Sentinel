@@ -7,6 +7,7 @@ class SatelliteOut(BaseModel):
     name:str |None = None
     tle_line1: str | None = None
     tle_line2: str | None = None
+    source: str | None = None
     last_updated: datetime | None = None
 
     class Config:
